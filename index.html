@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>My Cookbook Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+  ::-webkit-scrollbar{width:6px;}::-webkit-scrollbar-thumb{background:#ccc;border-radius:3px;}
+  textarea,input,button{font-family:inherit;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useRef,useEffect} = React;
+
+// ─── PASTE YOUR GEMINI API KEY BELOW ───────────────────────────────────────
+const GEMINI_API_KEY = "AIzaSyA3JShiOGMZc-RAXFXa6ArCZzyn2cwJ9KE";
+// ───────────────────────────────────────────────────────────────────────────
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+const THEMES = {
+  rustic:        {name:"Rustic",         primary:"#8B4513",accent:"#D2691E",bg:"#FDF6EE",card:"#FFF8F0",border:"#E8D5B7",text:"#3D1F0A",muted:"#8B6650",chapter:"#C17F3E"},
+  modern:        {name:"Modern Minimal", primary:"#1A1A1A",accent:"#4A4A4A",bg:"#F8F8F6",card:"#FFFFFF",border:"#E0E0DC",text:"#1A1A1A",muted:"#6B6B6B",chapter:"#2D2D2D"},
+  mediterranean: {name:"Mediterranean",  primary:"#1B4F72",accent:"#2E86AB",bg:"#EEF4F8",card:"#F5F9FC",border:"#B8D4E3",text:"#0D2B3E",muted:"#4A7A96",chapter:"#1B6CA8"},
+  garden:        {name:"Garden",         primary:"#2D5016",accent:"#4A7C25",bg:"#F2F7EE",card:"#F8FCF5",border:"#C4D9B3",text:"#1A3009",muted:"#4D6B38",chapter:"#3A6B1A"},
+  rose:          {name:"Rose Kitchen",   primary:"#7B2D3E",accent:"#B5485A",bg:"#FDF0F2",card:"#FFF5F6",border:"#E8C4CB",text:"#3D0D15",muted:"#9B5A66",chapter:"#A0364A"},
+};
+const DIFF = {easy:{label:"Easy",color:"#2D7A2D"},medium:{label:"Medium",color:"#B8860B"},hard:{label:"Hard",color:"#A0364A"}};
+const serif = "'Georgia','Times New Roman',serif";
+
+const SYSTEM = `You are a personal cookbook assistant. You help the user manage a beautifully structured cookbook.
+
+EVERY response MUST end with this exact marker and valid JSON (no markdown fences):
+
+COOKBOOK_STATE:
+{"title":"","author":"","tagline":"","chapters":[{"name":"","recipes":[{"title":"","description":"","servings":0,"prepTime":"","cookTime":"","difficulty":"easy","ingredients":[{"amount":"","unit":"","name":""}],"steps":[""],"notes":""}]}],"inventory":[""]}
+
+Rules:
+- Preserve ALL existing data unless explicitly asked to remove it.
+- Assign difficulty (easy/medium/hard) based on recipe complexity.
+- Metric conversion: oz->g(28g), cups->ml(240ml), tbsp->ml(15ml), tsp->ml(5ml), lb->kg(0.45kg), F->C((F-32)*5/9 rounded).
+- Inventory = deduplicated flat list of all ingredient names across all recipes.
+- Group recipes into logical chapters (Breakfast, Lunch, Dinner, Desserts, Snacks, Drinks, Sides).
+- Reply warmly and briefly before the COOKBOOK_STATE marker.`;
+
+const INITIAL = {title:"",author:"",tagline:"",chapters:[],inventory:[]};
+
+function parseState(txt){
+  const i=txt.lastIndexOf("COOKBOOK_STATE:");
+  if(i===-1)return null;
+  try{return JSON.parse(txt.slice(i+15).trim());}catch{return null;}
+}
+function getConvo(txt){
+  const i=txt.lastIndexOf("COOKBOOK_STATE:");
+  return i===-1?txt:txt.slice(0,i).trim();
+}
+
+const store={
+  get:k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}},
+};
+
+async function askGemini(systemPrompt, history, userMessage) {
+  // Build contents array: history + new user turn
+  const contents = [];
+  for(const m of history){
+    contents.push({role: m.role==="assistant"?"model":"user", parts:[{text:m.content}]});
+  }
+  contents.push({role:"user", parts:[{text:userMessage}]});
+
+  const body = {
+    system_instruction: {parts:[{text:systemPrompt}]},
+    contents,
+    generationConfig:{maxOutputTokens:4000, temperature:0.7}
+  };
+
+  const res = await fetch(GEMINI_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+}
+
+// ─── MAIN APP ───────────────────────────────────────────────────────────────
+export default function App(){
+  const [cb,setCb]             = useState(INITIAL);
+  const [msgs,setMsgs]         = useState([]);
+  const [input,setInput]       = useState("");
+  const [loading,setLoading]   = useState(false);
+  const [view,setView]         = useState("cover");
+  const [activeR,setActiveR]   = useState(null);
+  const [theme,setTheme]       = useState("rustic");
+  const [searchQ,setSearchQ]   = useState("");
+  const [shopList,setShopList] = useState([]);
+  const [showThemes,setShowThemes] = useState(false);
+  const [setupDone,setSetupDone]   = useState(false);
+  const [form,setForm]         = useState({title:"My Cookbook",author:"",tagline:""});
+  const chatEnd = useRef(null);
+  const stateRef= useRef(INITIAL);
+  const t = THEMES[theme];
+
+  useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:"smooth"});},[msgs,loading]);
+
+  useEffect(()=>{
+    const d=store.get("cbk_v3");
+    if(d){
+      if(d.cb){setCb(d.cb);stateRef.current=d.cb;}
+      if(d.msgs)setMsgs(d.msgs);
+      if(d.theme)setTheme(d.theme);
+      if(d.done){setSetupDone(true);setView("toc");}
+    }
+  },[]);
+
+  function save(c,m,th){store.set("cbk_v3",{cb:c,msgs:m,theme:th||theme,done:true});}
+
+  async function send(){
+    if(!input.trim()||loading)return;
+    const uMsg={role:"user",content:input.trim()};
+    const newMsgs=[...msgs,uMsg];
+    setMsgs(newMsgs);setInput("");setLoading(true);
+    const prompt=`Current cookbook state:\n${JSON.stringify(stateRef.current,null,2)}\n\nUser request: ${uMsg.content}`;
+    try{
+      const full = await askGemini(SYSTEM, msgs, prompt);
+      const ns=parseState(full);
+      const display=getConvo(full);
+      const aMsg={role:"assistant",content:display};
+      const upd=[...newMsgs,aMsg];
+      setMsgs(upd);
+      if(ns){setCb(ns);stateRef.current=ns;save(ns,upd,theme);}
+    }catch(e){
+      setMsgs(p=>[...p,{role:"assistant",content:`Error: ${e.message}. Check your API key.`}]);
+    }
+    setLoading(false);
+  }
+
+  function handleKey(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}
+
+  function addShop(recipe){
+    const items=recipe.ingredients?.map(i=>`${i.amount} ${i.unit} ${i.name}`.trim())||[];
+    setShopList(p=>[...new Set([...p,...items])]);
+    setView("shopping");
+  }
+
+  function random(){
+    const all=cb.chapters.flatMap(c=>c.recipes);
+    if(!all.length)return;
+    setActiveR(all[Math.floor(Math.random()*all.length)]);setView("recipe");
+  }
+
+  const allR=cb.chapters.flatMap(c=>c.recipes.map(r=>({...r,chapter:c.name})));
+  const filtered=searchQ?allR.filter(r=>r.title.toLowerCase().includes(searchQ.toLowerCase())||r.ingredients?.some(i=>i.name.toLowerCase().includes(searchQ.toLowerCase()))):[];
+
+  // ── SETUP SCREEN ──
+  if(!setupDone) return (
+    <div style={{minHeight:"100vh",background:THEMES.rustic.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{maxWidth:480,width:"100%",background:"#fff",borderRadius:16,border:`1px solid ${THEMES.rustic.border}`,padding:"40px 36px",textAlign:"center"}}>
+        <div style={{fontSize:40,marginBottom:8}}>📖</div>
+        <h1 style={{fontFamily:serif,fontSize:26,fontWeight:400,color:THEMES.rustic.text,margin:"0 0 6px"}}>Welcome to your Cookbook</h1>
+        <p style={{color:THEMES.rustic.muted,fontSize:14,margin:"0 0 28px"}}>Let's set up your cookbook before we begin.</p>
+        {["title","author","tagline"].map(f=>(
+          <div key={f} style={{marginBottom:14,textAlign:"left"}}>
+            <label style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.08em",color:THEMES.rustic.muted,display:"block",marginBottom:4}}>
+              {f==="tagline"?"Tagline (optional)":f.charAt(0).toUpperCase()+f.slice(1)}
+            </label>
+            <input value={form[f]} onChange={e=>setForm(p=>({...p,[f]:e.target.value}))}
+              placeholder={f==="title"?"My Family Cookbook":f==="author"?"Your name":"Recipes with love…"}
+              style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${THEMES.rustic.border}`,fontSize:14,background:THEMES.rustic.bg,color:THEMES.rustic.text}}/>
+          </div>
+        ))}
+        <div style={{marginBottom:20,textAlign:"left"}}>
+          <label style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.08em",color:THEMES.rustic.muted,display:"block",marginBottom:8}}>Color Theme</label>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {Object.entries(THEMES).map(([k,v])=>(
+              <button key={k} onClick={()=>setTheme(k)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${theme===k?v.primary:v.border}`,background:v.bg,color:v.primary,fontSize:12,cursor:"pointer",fontWeight:theme===k?600:400}}>{v.name}</button>
+            ))}
+          </div>
+        </div>
+        <button onClick={()=>{
+          const nc={...INITIAL,title:form.title||"My Cookbook",author:form.author,tagline:form.tagline};
+          setCb(nc);stateRef.current=nc;setSetupDone(true);setView("cover");save(nc,[],theme);
+        }} style={{width:"100%",padding:11,borderRadius:8,background:THEMES.rustic.primary,color:"#fff",border:"none",fontSize:15,fontWeight:500,cursor:"pointer"}}>
+          Start my cookbook →
+        </button>
+      </div>
+    </div>
+  );
+
+  // ── MAIN LAYOUT ──
+  return (
+    <div style={{display:"flex",height:"100vh",background:t.bg,overflow:"hidden"}}>
+
+      {/* LEFT PANEL */}
+      <div style={{width:"54%",display:"flex",flexDirection:"column",borderRight:`1px solid ${t.border}`,overflow:"hidden",background:t.bg}}>
+
+        {/* Nav */}
+        <div style={{padding:"10px 14px",borderBottom:`1px solid ${t.border}`,display:"flex",alignItems:"center",gap:6,flexShrink:0,background:t.card,flexWrap:"wrap"}}>
+          {[["cover","Cover"],["toc","Contents"],["inventory","Pantry"],["shopping","Shop"]].map(([v,l])=>(
+            <button key={v} onClick={()=>{setView(v);setActiveR(null);}}
+              style={{fontSize:12,padding:"4px 10px",borderRadius:99,border:`1px solid ${view===v?t.primary:t.border}`,background:view===v?t.primary:"transparent",color:view===v?"#fff":t.muted,cursor:"pointer"}}>{l}</button>
+          ))}
+          <div style={{flex:1}}/>
+          <button onClick={random} style={{fontSize:12,padding:"4px 10px",borderRadius:99,border:`1px solid ${t.border}`,background:"transparent",color:t.muted,cursor:"pointer"}}>🎲 Random</button>
+          <button onClick={()=>setShowThemes(p=>!p)} style={{fontSize:12,padding:"4px 10px",borderRadius:99,border:`1px solid ${t.border}`,background:"transparent",color:t.muted,cursor:"pointer"}}>🎨</button>
+        </div>
+
+        {showThemes&&(
+          <div style={{padding:"10px 14px",borderBottom:`1px solid ${t.border}`,display:"flex",gap:8,flexWrap:"wrap",background:t.card}}>
+            {Object.entries(THEMES).map(([k,v])=>(
+              <button key={k} onClick={()=>{setTheme(k);setShowThemes(false);save(cb,msgs,k);}}
+                style={{padding:"4px 12px",borderRadius:99,border:`2px solid ${theme===k?v.primary:v.border}`,background:v.bg,color:v.primary,fontSize:12,cursor:"pointer",fontWeight:theme===k?600:400}}>{v.name}</button>
+            ))}
+          </div>
+        )}
+
+        {/* Search */}
+        <div style={{padding:"8px 14px",borderBottom:`1px solid ${t.border}`,background:t.card,flexShrink:0}}>
+          <input value={searchQ} onChange={e=>setSearchQ(e.target.value)} placeholder="Search recipes or ingredients…"
+            style={{width:"100%",padding:"7px 12px",borderRadius:8,border:`1px solid ${t.border}`,fontSize:13,background:t.bg,color:t.text}}/>
+        </div>
+        {searchQ&&(
+          <div style={{padding:"8px 14px",borderBottom:`1px solid ${t.border}`,background:t.bg,maxHeight:180,overflowY:"auto"}}>
+            {filtered.length===0?<span style={{fontSize:12,color:t.muted}}>No results</span>:filtered.map((r,i)=>(
+              <div key={i} onClick={()=>{setActiveR(r);setView("recipe");setSearchQ("");}}
+                style={{padding:"6px 8px",borderRadius:6,cursor:"pointer",fontSize:13,color:t.text,display:"flex",justifyContent:"space-between"}}>
+                <span>{r.title}</span><span style={{fontSize:11,color:t.muted}}>{r.chapter}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Content */}
+        <div style={{flex:1,overflowY:"auto",padding:"16px 18px"}}>
+          {view==="cover"    &&<CoverView cb={cb} t={t} total={allR.length}/>}
+          {view==="toc"      &&<TocView cb={cb} t={t} onSelect={r=>{setActiveR(r);setView("recipe");}}/>}
+          {view==="recipe"   &&activeR&&<RecipeView r={activeR} t={t} onBack={()=>{setView("toc");setActiveR(null);}} onShop={addShop}/>}
+          {view==="inventory"&&<InventoryView cb={cb} t={t}/>}
+          {view==="shopping" &&<ShoppingView items={shopList} setItems={setShopList} t={t}/>}
+        </div>
+      </div>
+
+      {/* RIGHT PANEL — Chat */}
+      <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:t.card}}>
+        <div style={{padding:"12px 16px 10px",borderBottom:`1px solid ${t.border}`,flexShrink:0}}>
+          <div style={{fontFamily:serif,fontSize:16,color:t.text}}>Your cookbook assistant</div>
+          <p style={{margin:"2px 0 0",fontSize:11,color:t.muted}}>Add recipes · organize chapters · convert measurements · shopping lists</p>
+        </div>
+
+        <div style={{flex:1,overflowY:"auto",padding:"12px 16px",display:"flex",flexDirection:"column",gap:10}}>
+          {msgs.length===0&&(
+            <div style={{color:t.muted,fontSize:13,textAlign:"center",marginTop:32,lineHeight:2.2}}>
+              <div style={{fontSize:28,marginBottom:10}}>👨‍🍳</div>
+              {['"Add a recipe for banana bread"','"Organize my recipes into chapters"','"Convert everything to metric"','"Make a shopping list for lasagna"'].map((s,i)=>(
+                <div key={i} onClick={()=>setInput(s.replace(/"/g,""))} style={{cursor:"pointer",color:t.accent,textDecoration:"underline",textDecorationStyle:"dotted"}}>{s}</div>
+              ))}
+            </div>
+          )}
+          {msgs.map((m,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
+              <div style={{maxWidth:"86%",padding:"9px 13px",borderRadius:12,background:m.role==="user"?t.primary:t.bg,color:m.role==="user"?"#fff":t.text,fontSize:13,lineHeight:1.65,whiteSpace:"pre-wrap",border:m.role==="assistant"?`1px solid ${t.border}`:"none"}}>
+                {m.content}
+              </div>
+            </div>
+          ))}
+          {loading&&(
+            <div style={{display:"flex"}}>
+              <div style={{padding:"9px 13px",borderRadius:12,background:t.bg,fontSize:13,color:t.muted,border:`1px solid ${t.border}`}}>Thinking…</div>
+            </div>
+          )}
+          <div ref={chatEnd}/>
+        </div>
+
+        <div style={{padding:"10px 12px",borderTop:`1px solid ${t.border}`,display:"flex",gap:8,flexShrink:0,background:t.card}}>
+          <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={handleKey}
+            placeholder="Add a recipe, organize chapters, convert to metric…" rows={2}
+            style={{flex:1,resize:"none",fontSize:13,padding:"8px 10px",borderRadius:8,border:`1px solid ${t.border}`,background:t.bg,color:t.text}}/>
+          <button onClick={send} disabled={loading||!input.trim()}
+            style={{alignSelf:"flex-end",padding:"9px 16px",borderRadius:8,border:"none",background:t.primary,color:"#fff",fontSize:13,cursor:loading||!input.trim()?"not-allowed":"pointer",opacity:loading||!input.trim()?0.5:1}}>
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SUB-COMPONENTS ─────────────────────────────────────────────────────────
+
+function CoverView({cb,t,total}){
+  return(
+    <div style={{textAlign:"center",padding:"32px 16px"}}>
+      <div style={{width:72,height:4,background:t.primary,margin:"0 auto 28px",borderRadius:2}}/>
+      <h1 style={{fontFamily:serif,fontSize:36,fontWeight:400,color:t.text,margin:"0 0 10px",lineHeight:1.2}}>{cb.title||"My Cookbook"}</h1>
+      {cb.author&&<p style={{fontFamily:serif,fontSize:16,color:t.muted,margin:"0 0 8px",fontStyle:"italic"}}>by {cb.author}</p>}
+      {cb.tagline&&<p style={{fontSize:14,color:t.muted,margin:"0 0 28px"}}>{cb.tagline}</p>}
+      <div style={{width:72,height:4,background:t.primary,margin:"0 auto 36px",borderRadius:2}}/>
+      <div style={{display:"flex",justifyContent:"center",gap:24,marginBottom:36}}>
+        {[["Recipes",total],["Chapters",cb.chapters.length],["Ingredients",cb.inventory.length]].map(([l,v])=>(
+          <div key={l}><div style={{fontSize:28,fontFamily:serif,color:t.primary}}>{v}</div><div style={{fontSize:11,color:t.muted,textTransform:"uppercase",letterSpacing:"0.08em"}}>{l}</div></div>
+        ))}
+      </div>
+      {cb.chapters.length>0&&(
+        <div style={{textAlign:"left",maxWidth:360,margin:"0 auto"}}>
+          <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.1em",color:t.muted,marginBottom:12}}>Chapters</div>
+          {cb.chapters.map((ch,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px dashed ${t.border}`,fontSize:14,color:t.text}}>
+              <span style={{fontFamily:serif}}>{ch.name}</span>
+              <span style={{color:t.muted,fontSize:12}}>{ch.recipes.length} recipe{ch.recipes.length!==1?"s":""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {cb.chapters.length===0&&<p style={{color:t.muted,fontSize:14,fontStyle:"italic"}}>Your cookbook is empty — ask your assistant to add a recipe!</p>}
+    </div>
+  );
+}
+
+function TocView({cb,t,onSelect}){
+  const [open,setOpen]=useState({});
+  useEffect(()=>{const o={};cb.chapters.forEach((_,i)=>o[i]=true);setOpen(o);},[cb.chapters.length]);
+  if(!cb.chapters.length)return<div style={{textAlign:"center",color:t.muted,fontSize:14,marginTop:48,fontStyle:"italic"}}>No recipes yet. Ask your assistant to add one!</div>;
+  return(
+    <div>
+      {cb.chapters.map((ch,ci)=>(
+        <div key={ci} style={{marginBottom:18}}>
+          <div onClick={()=>setOpen(p=>({...p,[ci]:!p[ci]}))} style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",padding:"6px 0",borderBottom:`2px solid ${t.chapter}`,marginBottom:8}}>
+            <span style={{fontFamily:serif,fontSize:17,color:t.chapter}}>{ch.name}</span>
+            <span style={{fontSize:11,color:t.muted}}>{ch.recipes.length} recipe{ch.recipes.length!==1?"s":""} {open[ci]?"▲":"▼"}</span>
+          </div>
+          {open[ci]&&ch.recipes.map((r,ri)=>(
+            <div key={ri} onClick={()=>onSelect(r)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 10px",borderRadius:8,marginBottom:3,cursor:"pointer",borderBottom:`1px solid ${t.border}`}}>
+              <div>
+                <span style={{fontSize:14,color:t.text,fontFamily:serif}}>{r.title}</span>
+                {r.description&&<div style={{fontSize:11,color:t.muted,marginTop:1}}>{r.description}</div>}
+              </div>
+              <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0,marginLeft:8}}>
+                {r.difficulty&&<span style={{fontSize:10,padding:"2px 7px",borderRadius:99,background:DIFF[r.difficulty]?.color+"20",color:DIFF[r.difficulty]?.color,fontWeight:600}}>{DIFF[r.difficulty]?.label}</span>}
+                {r.cookTime&&<span style={{fontSize:11,color:t.muted}}>⏱ {r.cookTime}</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RecipeView({r,t,onBack,onShop}){
+  return(
+    <div>
+      <button onClick={onBack} style={{fontSize:12,color:t.muted,background:"none",border:"none",cursor:"pointer",padding:"0 0 14px",display:"flex",alignItems:"center",gap:4}}>← Back to contents</button>
+      <div style={{borderLeft:`4px solid ${t.chapter}`,paddingLeft:14,marginBottom:16}}>
+        <h2 style={{fontFamily:serif,fontSize:22,fontWeight:400,color:t.text,margin:"0 0 4px"}}>{r.title}</h2>
+        {r.description&&<p style={{margin:0,color:t.muted,fontSize:13,fontStyle:"italic"}}>{r.description}</p>}
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
+        {r.servings&&<Chip icon="🍽" label={`${r.servings} servings`} t={t}/>}
+        {r.prepTime&&<Chip icon="🥄" label={`Prep: ${r.prepTime}`} t={t}/>}
+        {r.cookTime&&<Chip icon="⏱" label={`Cook: ${r.cookTime}`} t={t}/>}
+        {r.difficulty&&<span style={{fontSize:11,padding:"4px 10px",borderRadius:99,background:DIFF[r.difficulty]?.color+"20",color:DIFF[r.difficulty]?.color,fontWeight:600}}>{DIFF[r.difficulty]?.label}</span>}
+      </div>
+      <button onClick={()=>onShop(r)} style={{fontSize:12,padding:"5px 12px",borderRadius:99,border:`1px solid ${t.border}`,background:"transparent",color:t.muted,cursor:"pointer",marginBottom:16}}>+ Add to shopping list</button>
+      <Section title="Ingredients" t={t}>
+        {r.ingredients?.map((ing,i)=>(
+          <div key={i} style={{display:"flex",gap:8,padding:"5px 0",borderBottom:`1px solid ${t.border}`,fontSize:13}}>
+            <span style={{fontWeight:600,color:t.chapter,minWidth:80}}>{ing.amount} {ing.unit}</span>
+            <span style={{color:t.text}}>{ing.name}</span>
+          </div>
+        ))}
+      </Section>
+      <Section title="Instructions" t={t}>
+        {r.steps?.map((step,i)=>(
+          <div key={i} style={{display:"flex",gap:12,padding:"8px 0",borderBottom:`1px solid ${t.border}`,fontSize:13,alignItems:"flex-start"}}>
+            <span style={{minWidth:22,height:22,borderRadius:"50%",background:t.chapter,color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,flexShrink:0,marginTop:1}}>{i+1}</span>
+            <span style={{color:t.text,lineHeight:1.6}}>{step}</span>
+          </div>
+        ))}
+      </Section>
+      {r.notes&&<Section title="Notes" t={t}><p style={{fontSize:13,margin:0,color:t.muted,fontStyle:"italic",lineHeight:1.6}}>{r.notes}</p></Section>}
+    </div>
+  );
+}
+
+function Section({title,t,children}){
+  return(
+    <div style={{marginBottom:18}}>
+      <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.1em",color:t.chapter,marginBottom:8}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Chip({icon,label,t}){
+  return<span style={{fontSize:12,padding:"4px 10px",borderRadius:99,border:`1px solid ${t.border}`,background:t.card,color:t.muted}}>{icon} {label}</span>;
+}
+
+function InventoryView({cb,t}){
+  const byChapter=cb.chapters.map(ch=>({name:ch.name,items:[...new Set(ch.recipes.flatMap(r=>r.ingredients?.map(i=>i.name)||[]))]}));
+  return(
+    <div>
+      <h2 style={{fontFamily:serif,fontWeight:400,fontSize:20,color:t.text,margin:"0 0 4px"}}>Pantry Inventory</h2>
+      <p style={{color:t.muted,fontSize:13,marginBottom:20}}>{cb.inventory.length} unique ingredients across {cb.chapters.length} chapters</p>
+      {byChapter.map((ch,i)=>ch.items.length>0&&(
+        <div key={i} style={{marginBottom:16}}>
+          <div style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.1em",color:t.chapter,marginBottom:8}}>{ch.name}</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+            {ch.items.map((item,j)=><span key={j} style={{fontSize:12,padding:"3px 10px",borderRadius:99,border:`1px solid ${t.border}`,color:t.text,background:t.card}}>{item}</span>)}
+          </div>
+        </div>
+      ))}
+      {cb.inventory.length===0&&<p style={{color:t.muted,fontSize:14,fontStyle:"italic"}}>Add some recipes to populate your pantry.</p>}
+    </div>
+  );
+}
+
+function ShoppingView({items,setItems,t}){
+  const [checked,setChecked]=useState({});
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:16}}>
+        <h2 style={{fontFamily:serif,fontWeight:400,fontSize:20,color:t.text,margin:0}}>Shopping List</h2>
+        <button onClick={()=>{setItems([]);setChecked({});}} style={{fontSize:12,color:t.muted,background:"none",border:"none",cursor:"pointer"}}>Clear all</button>
+      </div>
+      {items.length===0&&<p style={{color:t.muted,fontSize:14,fontStyle:"italic"}}>Open any recipe and tap "Add to shopping list".</p>}
+      {items.map((item,i)=>(
+        <div key={i} onClick={()=>setChecked(p=>({...p,[i]:!p[i]}))} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:`1px solid ${t.border}`,cursor:"pointer"}}>
+          <div style={{width:18,height:18,borderRadius:4,border:`2px solid ${checked[i]?t.primary:t.border}`,background:checked[i]?t.primary:"transparent",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            {checked[i]&&<span style={{color:"#fff",fontSize:11}}>✓</span>}
+          </div>
+          <span style={{fontSize:13,color:t.text,textDecoration:checked[i]?"line-through":"none",opacity:checked[i]?0.45:1}}>{item}</span>
+        </div>
+      ))}
+      {items.length>0&&<p style={{fontSize:12,color:t.muted,marginTop:10}}>{items.filter((_,i)=>checked[i]).length} of {items.length} checked</p>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
